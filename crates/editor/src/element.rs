@@ -284,7 +284,6 @@ impl EditorElement {
         register_action(editor, window, Editor::copy);
         register_action(editor, window, Editor::copy_and_trim);
         register_action(editor, window, Editor::diff_clipboard_with_selection);
-        register_action(editor, window, Editor::compare_active_file_with);
         register_action(editor, window, Editor::compare_active_file_with_clipboard);
         register_action(editor, window, Editor::paste);
         register_action(editor, window, Editor::undo);

@@ -17,6 +17,7 @@ use ui::{
 
 mod blame_ui;
 pub mod clone;
+mod file_comparison_picker;
 
 use git::{
     repository::{Branch, Upstream, UpstreamTracking, UpstreamTrackingStatus},
@@ -34,7 +35,9 @@ use ui::prelude::*;
 use workspace::{ModalView, Workspace, notifications::DetachAndPromptErr};
 use zed_actions;
 
-use crate::{git_panel::GitPanel, text_diff_view::TextDiffView};
+use crate::{
+    file_comparison_picker::FileComparisonPicker, git_panel::GitPanel, text_diff_view::TextDiffView,
+};
 
 mod askpass_modal;
 pub mod branch_picker;
@@ -312,81 +315,48 @@ fn compare_active_file_with(
         return;
     };
 
-    let project = workspace.project().clone();
-    let workspace_handle = workspace.weak_handle();
-
-    // Get the title for the active buffer
-    let active_title: SharedString = active_buffer
-        .read(cx)
-        .file()
-        .map(|f| f.file_name(cx).to_string())
-        .unwrap_or_else(|| "Untitled".to_string())
-        .into();
-
-    // Show file picker
-    let paths = workspace.prompt_for_open_path(
-        gpui::PathPromptOptions {
-            files: true,
-            directories: false,
-            multiple: false,
-            prompt: Some("Select file to compare with".into()),
-        },
-        project::DirectoryLister::Project(project.clone()),
-        window,
-        cx,
-    );
-
     let active_buffer = active_buffer.clone();
-    let task = window.spawn(cx, async move |cx| {
-        let mut selected_paths = paths
-            .await
-            .ok()
-            .flatten()
-            .ok_or_else(|| anyhow::anyhow!("No file selected"))?;
-        let compare_path = selected_paths
-            .pop()
-            .ok_or_else(|| anyhow::anyhow!("No file selected"))?;
+    let workspace_handle = workspace.weak_handle();
+    let project = workspace.project().clone();
 
-        let compare_buffer = project
-            .update(cx, |project, cx| {
-                project.open_local_buffer(&compare_path, cx)
-            })?
-            .await?;
+    // Collect open buffers before creating modal to avoid workspace double-borrow
+    let active_buffer_id = active_buffer.read(cx).remote_id();
+    let mut open_buffers = Vec::new();
 
-        let compare_title: SharedString = compare_path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("file")
-            .to_string()
-            .into();
+    for pane in workspace.panes() {
+        let pane_read = pane.read(cx);
+        let items: Vec<Box<dyn workspace::item::ItemHandle>> =
+            pane_read.items().map(|item| item.boxed_clone()).collect();
 
-        let languages = project.read_with(cx, |project, _| project.languages().clone())?;
-        let diff = build_diff_buffer(&active_buffer, &compare_buffer, languages, cx).await?;
+        let details = workspace::pane::tab_details(&items, window, cx);
 
-        workspace_handle.update_in(cx, |workspace, window, cx| {
-            let diff_view = cx.new(|cx| {
-                TextDiffView::new_from_buffers(
-                    compare_buffer,
-                    active_buffer,
-                    diff,
-                    project.clone(),
-                    compare_title,
-                    active_title,
-                    window,
-                    cx,
-                )
-            });
+        for (item, detail_level) in items.iter().zip(details) {
+            if let Some(editor) = item.act_as::<Editor>(cx) {
+                let buffer = editor.read(cx).buffer().read(cx);
+                if let Some(singleton_buffer) = buffer.as_singleton() {
+                    // Skip the active buffer
+                    if singleton_buffer.read(cx).remote_id() == active_buffer_id {
+                        continue;
+                    }
 
-            let pane = workspace.active_pane();
-            pane.update(cx, |pane, cx| {
-                pane.add_item(Box::new(diff_view.clone()), true, true, None, window, cx);
-            });
+                    let display_text = item.tab_content_text(detail_level, cx);
+                    open_buffers.push((singleton_buffer.clone(), display_text));
+                }
+            }
+        }
+    }
 
-            diff_view
-        })
+    // Show custom picker with pre-collected open buffers
+    workspace.toggle_modal(window, cx, |window, cx| {
+        FileComparisonPicker::new(
+            active_buffer,
+            workspace_handle,
+            project,
+            open_buffers,
+            window,
+            cx,
+        )
     });
-
-    task.detach_and_log_err(cx);
 }
 
 fn compare_file_with_clipboard(
@@ -458,7 +428,7 @@ fn compare_file_with_clipboard(
     task.detach_and_log_err(cx);
 }
 
-async fn build_diff_buffer(
+pub async fn build_diff_buffer(
     left_buffer: &Entity<language::Buffer>,
     right_buffer: &Entity<language::Buffer>,
     language_registry: Arc<language::LanguageRegistry>,
