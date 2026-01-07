@@ -13478,6 +13478,50 @@ impl Editor {
         );
     }
 
+    pub fn compare_active_file_with(
+        &mut self,
+        _: &CompareActiveFileWith,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) {
+        // This action is handled at the workspace level to show a file picker
+        // The actual implementation is in git_ui/src/git_ui.rs
+    }
+
+    pub fn compare_active_file_with_clipboard(
+        &mut self,
+        _: &CompareActiveFileWithClipboard,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let multibuffer = self.buffer().read(cx);
+        let Some(_buffer) = multibuffer.as_singleton() else {
+            log::warn!("Cannot compare multi-buffer editors with clipboard.");
+            return;
+        };
+
+        let clipboard_text = match cx.read_from_clipboard() {
+            Some(item) => match item.entries().first() {
+                Some(ClipboardEntry::String(text)) => Some(text.text().to_string()),
+                _ => None,
+            },
+            None => None,
+        };
+
+        let Some(clipboard_text) = clipboard_text else {
+            log::warn!("Clipboard doesn't contain text.");
+            return;
+        };
+
+        window.dispatch_action(
+            Box::new(CompareActiveFileWithClipboardData {
+                buffer: cx.entity().clone(),
+                clipboard_text,
+            }),
+            cx,
+        );
+    }
+
     pub fn paste(&mut self, _: &Paste, window: &mut Window, cx: &mut Context<Self>) {
         self.hide_mouse_cursor(HideMouseCursorOrigin::TypingAction, cx);
         if let Some(item) = cx.read_from_clipboard() {

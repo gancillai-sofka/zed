@@ -1,9 +1,14 @@
-use std::any::Any;
+use std::{any::Any, sync::Arc};
 
 use anyhow::anyhow;
 use command_palette_hooks::CommandPaletteFilter;
 use commit_modal::CommitModal;
-use editor::{Editor, actions::DiffClipboardWithSelectionData};
+use editor::{
+    Editor,
+    actions::{
+        CompareActiveFileWith, CompareActiveFileWithClipboardData, DiffClipboardWithSelectionData,
+    },
+};
 use project::ProjectPath;
 use ui::{
     Headline, HeadlineSize, Icon, IconName, IconSize, IntoElement, ParentElement, Render, Styled,
@@ -241,6 +246,14 @@ pub fn init(cx: &mut App) {
                 };
             },
         );
+        workspace.register_action(|workspace, _: &CompareActiveFileWith, window, cx| {
+            compare_active_file_with(workspace, window, cx);
+        });
+        workspace.register_action(
+            |workspace, action: &CompareActiveFileWithClipboardData, window, cx| {
+                compare_file_with_clipboard(action, workspace, window, cx);
+            },
+        );
         workspace.register_action(|workspace, _: &git::FileHistory, window, cx| {
             let Some(active_item) = workspace.active_item(cx) else {
                 return;
@@ -278,6 +291,209 @@ pub fn init(cx: &mut App) {
         });
     })
     .detach();
+}
+
+fn compare_active_file_with(
+    workspace: &mut Workspace,
+    window: &mut Window,
+    cx: &mut Context<Workspace>,
+) {
+    let Some(active_editor) = workspace
+        .active_item(cx)
+        .and_then(|item| item.act_as::<Editor>(cx))
+    else {
+        log::warn!("No active editor to compare");
+        return;
+    };
+
+    let editor_buffer = active_editor.read(cx).buffer().read(cx);
+    let Some(active_buffer) = editor_buffer.as_singleton() else {
+        log::warn!("Cannot compare multi-buffer editors");
+        return;
+    };
+
+    let project = workspace.project().clone();
+    let workspace_handle = workspace.weak_handle();
+
+    // Get the title for the active buffer
+    let active_title: SharedString = active_buffer
+        .read(cx)
+        .file()
+        .map(|f| f.file_name(cx).to_string())
+        .unwrap_or_else(|| "Untitled".to_string())
+        .into();
+
+    // Show file picker
+    let paths = workspace.prompt_for_open_path(
+        gpui::PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: false,
+            prompt: Some("Select file to compare with".into()),
+        },
+        project::DirectoryLister::Project(project.clone()),
+        window,
+        cx,
+    );
+
+    let active_buffer = active_buffer.clone();
+    let task = window.spawn(cx, async move |cx| {
+        let mut selected_paths = paths
+            .await
+            .ok()
+            .flatten()
+            .ok_or_else(|| anyhow::anyhow!("No file selected"))?;
+        let compare_path = selected_paths
+            .pop()
+            .ok_or_else(|| anyhow::anyhow!("No file selected"))?;
+
+        let compare_buffer = project
+            .update(cx, |project, cx| {
+                project.open_local_buffer(&compare_path, cx)
+            })?
+            .await?;
+
+        let compare_title: SharedString = compare_path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("file")
+            .to_string()
+            .into();
+
+        let languages = project.read_with(cx, |project, _| project.languages().clone())?;
+        let diff = build_diff_buffer(&active_buffer, &compare_buffer, languages, cx).await?;
+
+        workspace_handle.update_in(cx, |workspace, window, cx| {
+            let diff_view = cx.new(|cx| {
+                TextDiffView::new_from_buffers(
+                    compare_buffer,
+                    active_buffer,
+                    diff,
+                    project.clone(),
+                    compare_title,
+                    active_title,
+                    window,
+                    cx,
+                )
+            });
+
+            let pane = workspace.active_pane();
+            pane.update(cx, |pane, cx| {
+                pane.add_item(Box::new(diff_view.clone()), true, true, None, window, cx);
+            });
+
+            diff_view
+        })
+    });
+
+    task.detach_and_log_err(cx);
+}
+
+fn compare_file_with_clipboard(
+    action: &CompareActiveFileWithClipboardData,
+    workspace: &mut Workspace,
+    window: &mut Window,
+    cx: &mut Context<Workspace>,
+) {
+    let editor = action.buffer.clone();
+    let clipboard_text = action.clipboard_text.clone();
+    let project = workspace.project().clone();
+    let workspace_handle = workspace.weak_handle();
+
+    let editor_buffer = editor.read(cx).buffer().read(cx);
+    let Some(active_buffer) = editor_buffer.as_singleton() else {
+        log::warn!("Cannot compare multi-buffer editors with clipboard");
+        return;
+    };
+
+    let active_buffer = active_buffer.clone();
+
+    // Get the title for the active buffer
+    let file_name: SharedString = active_buffer
+        .read(cx)
+        .file()
+        .map(|f| f.file_name(cx).to_string())
+        .unwrap_or_else(|| "Untitled".to_string())
+        .into();
+
+    let task = window.spawn(cx, async move |cx| {
+        let mut clipboard_text = clipboard_text;
+        if !clipboard_text.ends_with("\n") {
+            clipboard_text.push_str("\n");
+        }
+
+        let clipboard_buffer = cx.new(|cx| {
+            let mut buffer = language::Buffer::local(clipboard_text, cx);
+            let language = active_buffer.read(cx).language().cloned();
+            buffer.set_language(language, cx);
+            buffer
+        })?;
+
+        let languages = project.read_with(cx, |project, _| project.languages().clone())?;
+        let diff = build_diff_buffer(&active_buffer, &clipboard_buffer, languages, cx).await?;
+
+        workspace_handle.update_in(cx, |workspace, window, cx| {
+            let diff_view = cx.new(|cx| {
+                TextDiffView::new_from_buffers(
+                    clipboard_buffer,
+                    active_buffer,
+                    diff,
+                    project.clone(),
+                    "Clipboard".into(),
+                    file_name,
+                    window,
+                    cx,
+                )
+            });
+
+            let pane = workspace.active_pane();
+            pane.update(cx, |pane, cx| {
+                pane.add_item(Box::new(diff_view.clone()), true, true, None, window, cx);
+            });
+
+            diff_view
+        })
+    });
+
+    task.detach_and_log_err(cx);
+}
+
+async fn build_diff_buffer(
+    left_buffer: &Entity<language::Buffer>,
+    right_buffer: &Entity<language::Buffer>,
+    language_registry: Arc<language::LanguageRegistry>,
+    cx: &mut gpui::AsyncApp,
+) -> anyhow::Result<Entity<buffer_diff::BufferDiff>> {
+    use buffer_diff::BufferDiff;
+
+    let left_snapshot = left_buffer.read_with(cx, |buffer, _| buffer.snapshot())?;
+    let right_snapshot = right_buffer.read_with(cx, |buffer, _| buffer.snapshot())?;
+
+    let diff = cx.new(|cx| BufferDiff::new(&left_snapshot.text, cx))?;
+
+    let update = diff
+        .update(cx, |diff, cx| {
+            diff.update_diff(
+                left_snapshot.text.clone(),
+                Some(right_snapshot.text().into()),
+                true,
+                left_snapshot.language().cloned(),
+                cx,
+            )
+        })?
+        .await;
+
+    diff.update(cx, |diff, cx| {
+        diff.language_changed(
+            left_snapshot.language().cloned(),
+            Some(language_registry),
+            cx,
+        );
+        diff.set_snapshot(update, &left_snapshot.text, cx)
+    })?
+    .await;
+
+    Ok(diff)
 }
 
 fn open_modified_files(

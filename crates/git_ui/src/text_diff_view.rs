@@ -132,6 +132,94 @@ impl TextDiffView {
         Some(task)
     }
 
+    pub fn new_from_buffers(
+        left_buffer: Entity<Buffer>,
+        right_buffer: Entity<Buffer>,
+        diff_buffer: Entity<BufferDiff>,
+        project: Entity<Project>,
+        left_title: SharedString,
+        right_title: SharedString,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let multibuffer = cx.new(|cx| {
+            let mut multibuffer = MultiBuffer::singleton(right_buffer.clone(), cx);
+            multibuffer.add_diff(diff_buffer.clone(), cx);
+            multibuffer
+        });
+        let diff_editor = cx.new(|cx| {
+            let mut editor = Editor::for_multibuffer(multibuffer, Some(project), window, cx);
+            editor.start_temporary_diff_override();
+            editor.disable_diagnostics(cx);
+            editor.set_expand_all_diff_hunks(cx);
+            editor.set_render_diff_hunk_controls(
+                Arc::new(|_, _, _, _, _, _, _, _| gpui::Empty.into_any_element()),
+                cx,
+            );
+            editor
+        });
+
+        let (buffer_changes_tx, mut buffer_changes_rx) = watch::channel(());
+
+        for buffer in [&left_buffer, &right_buffer] {
+            cx.subscribe(buffer, move |this, _, event, _| match event {
+                language::BufferEvent::Edited
+                | language::BufferEvent::LanguageChanged(_)
+                | language::BufferEvent::Reparsed => {
+                    this.buffer_changes_tx.send(()).ok();
+                }
+                _ => {}
+            })
+            .detach();
+        }
+
+        Self {
+            diff_editor,
+            title: format!("{} ↔ {}", left_title, right_title).into(),
+            path: Some(format!("{} ↔ {}", left_title, right_title).into()),
+            buffer_changes_tx,
+            _recalculate_diff_task: cx.spawn(async move |_, cx| {
+                while buffer_changes_rx.recv().await.is_ok() {
+                    loop {
+                        let mut timer = cx
+                            .background_executor()
+                            .timer(RECALCULATE_DIFF_DEBOUNCE)
+                            .fuse();
+                        let mut recv = pin!(buffer_changes_rx.recv().fuse());
+                        select_biased! {
+                            _ = timer => break,
+                            _ = recv => continue,
+                        }
+                    }
+
+                    log::trace!("start recalculating");
+                    let (left_snapshot, right_snapshot) = cx
+                        .update(|cx| {
+                            (
+                                left_buffer.read(cx).snapshot(),
+                                right_buffer.read(cx).snapshot(),
+                            )
+                        })
+                        .ok()
+                        .ok_or_else(|| anyhow::anyhow!("Failed to read buffer snapshots"))?;
+                    diff_buffer
+                        .update(cx, |diff, cx| {
+                            diff.set_base_text(
+                                Some(left_snapshot.text().as_str().into()),
+                                left_snapshot.language().cloned(),
+                                right_snapshot.text.clone(),
+                                cx,
+                            )
+                        })?
+                        .await
+                        .ok();
+                    log::trace!("finish recalculating");
+                }
+                Ok(())
+            }),
+        }
+    }
+
     pub fn new(
         clipboard_buffer: Entity<Buffer>,
         source_editor: Entity<Editor>,

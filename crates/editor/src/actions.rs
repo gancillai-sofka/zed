@@ -3,6 +3,7 @@ use super::*;
 use gpui::{Action, actions};
 use project::project_settings::GoToDiagnosticSeverityFilter;
 use schemars::JsonSchema;
+use serde::{Deserialize, Serialize};
 use util::serde::default_true;
 
 /// Selects the next occurrence of the current selection.
@@ -274,6 +275,23 @@ pub struct DiffClipboardWithSelectionData {
     pub editor: Entity<Editor>,
 }
 
+/// Data structure containing information for comparing the active file with another file.
+#[derive(Clone, PartialEq, Deserialize, Serialize, JsonSchema, Action)]
+#[action(namespace = editor)]
+#[serde(deny_unknown_fields)]
+pub struct CompareActiveFileWithData {
+    pub active_file_path: std::path::PathBuf,
+    pub compare_file_path: std::path::PathBuf,
+}
+
+/// Data structure containing information for comparing the active file with clipboard content.
+#[derive(Clone, PartialEq, Action)]
+#[action(no_json, no_register)]
+pub struct CompareActiveFileWithClipboardData {
+    pub buffer: Entity<crate::Editor>,
+    pub clipboard_text: String,
+}
+
 #[derive(Debug, PartialEq, Eq, Clone, Copy, Deserialize, Default)]
 pub enum UuidVersion {
     #[default]
@@ -456,6 +474,10 @@ actions!(
         DeleteToPreviousSubwordStart,
         /// Diffs the text stored in the clipboard against the current selection.
         DiffClipboardWithSelection,
+        /// Compares the active file with another file.
+        CompareActiveFileWith,
+        /// Compares the active file with clipboard content.
+        CompareActiveFileWithClipboard,
         /// Displays names of all active cursors.
         DisplayCursorNames,
         /// Duplicates the current line below.
